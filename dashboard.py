@@ -1,10 +1,10 @@
 """
 Insider Trading Feed Dashboard — Streamlit App
 ================================================
-Two modes:
-  1. MARKET SCAN  — auto-discovers Form 4 filings market-wide for either a
-     rolling recent window OR a specific historical date you pick (up to
-     years back), filtered to companies under a market-cap ceiling.
+Modes:
+  1. MARKET SCAN — auto-discovers Form 4 filings market-wide for either a
+     rolling recent window OR a specific DATE RANGE you pick (up to years
+     back), filtered to companies under a market-cap ceiling.
   2. SINGLE TICKER SEARCH — type in one ticker to pull its full insider
      trading history directly, no date/market scan needed.
 
@@ -261,21 +261,40 @@ def attach_price_performance(df, lookback_years):
 
 
 # ---------------------------------------------------------------------------
-# 5a. MARKET SCAN pipeline — supports a specific date OR rolling recent window
+# 5a. MARKET SCAN pipeline — supports a DATE RANGE or rolling recent window
 # ---------------------------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=1800)
-def run_market_scan_for_date(target_date: date, cap_ceiling: float, one_off_threshold: float,
-                              ceo_only: bool, max_filings: int, lookback_years: int):
-    """Scan Form 4 filings for ONE specific date (can be years in the past)."""
+def run_market_scan_for_date_range(start_date: date, end_date: date, cap_ceiling: float,
+                                    one_off_threshold: float, ceo_only: bool, max_filings: int,
+                                    lookback_years: int):
+    """Scan Form 4 filings across an entire date range (can span years back)."""
     cik_ticker_map = get_cik_ticker_map()
-    entries = get_daily_form4_index(target_date)
-    if entries is None:
-        return pd.DataFrame(), 0, False  # False = index not available (weekend/holiday/future)
 
-    entries = entries[:max_filings]
+    all_entries = []
+    d = start_date
+    days_with_data = 0
+    days_without_data = []
+    while d <= end_date:
+        if d.weekday() < 5:  # skip weekends
+            entries = get_daily_form4_index(d)
+            if entries is not None:
+                all_entries.extend(entries)
+                days_with_data += 1
+            else:
+                days_without_data.append(d)
+        d += timedelta(days=1)
+
+    seen = set()
+    unique_entries = []
+    for e in all_entries:
+        if e["filename"] not in seen:
+            seen.add(e["filename"])
+            unique_entries.append(e)
+    unique_entries = unique_entries[:max_filings]
+
     all_rows = []
     mcap_cache = {}
-    for entry in entries:
+    for entry in unique_entries:
         cik = entry["cik"]
         ticker = cik_ticker_map.get(str(int(cik))) if cik.isdigit() else None
         if not ticker:
@@ -294,7 +313,7 @@ def run_market_scan_for_date(target_date: date, cap_ceiling: float, one_off_thre
 
     df = pd.DataFrame(all_rows)
     df = attach_price_performance(df, lookback_years)
-    return df, len(entries), True
+    return df, len(unique_entries), days_with_data
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
@@ -414,28 +433,40 @@ def fetch_and_parse_filing_from_text(xml_text, cik):
 # UI
 # ---------------------------------------------------------------------------
 st.title("📈 Insider Trading Feed — Small-Cap Auto-Discovery")
-st.caption("Scan the entire market for a specific date, a rolling recent window, or search one ticker directly.")
+st.caption("Scan the entire market for a date range, a rolling recent window, or search one ticker directly.")
 
-# --- Top search bar for single-ticker lookup ---
+# --- Top search bar for single-ticker lookup (fixed alignment via matching labels) ---
 search_col1, search_col2 = st.columns([4, 1])
 with search_col1:
-    ticker_search = st.text_input("🔍 Search a single ticker (bypasses market scan)", placeholder="e.g. BBAI")
+    ticker_search = st.text_input(
+        "🔍 Search a single ticker (bypasses market scan)",
+        placeholder="e.g. BBAI",
+        label_visibility="visible",
+        key="ticker_search_input",
+    )
 with search_col2:
+    st.markdown(
+        "<div style='height: 28px'></div>",
+        unsafe_allow_html=True,
+    )  # spacer to match the text_input's label height so the button lines up
     search_btn = st.button("Search Ticker", type="primary", use_container_width=True)
 
 st.divider()
 
 with st.sidebar:
     st.header("Market Scan Settings")
-    scan_mode = st.radio("Scan mode", ["Specific date", "Rolling recent window"], index=0)
+    scan_mode = st.radio("Scan mode", ["Date range", "Rolling recent window"], index=0)
 
-    if scan_mode == "Specific date":
-        selected_date = st.date_input(
-            "Pick a date to retrieve filings for",
-            value=date.today() - timedelta(days=1),
+    if scan_mode == "Date range":
+        default_end = date.today() - timedelta(days=1)
+        default_start = default_end - timedelta(days=7)
+        date_range = st.date_input(
+            "Pick a date range to retrieve filings for",
+            value=(default_start, default_end),
             min_value=date(2001, 1, 1),
-            max_value=date.today() - timedelta(days=1),
-            help="Works for any past date, including years back — SEC's daily index is available historically."
+            max_value=default_end,
+            help="Works for any past range, including years back — SEC's daily index is available historically. "
+                 "Select a start and end date; wider ranges take longer to scan."
         )
     else:
         days_back = st.slider("Days of filings to scan", 1, 10, 3,
@@ -447,7 +478,7 @@ with st.sidebar:
     max_filings = st.slider("Max filings to fetch (rate-limit safety)", 50, 1000, 300, 50)
     lookback_years = st.slider("Price performance lookback (years)", 1, 5, 5)
     run_btn = st.button("Scan Market", type="primary")
-    st.caption("Note: each filing is a live SEC request, so more filings/days = longer scan time.")
+    st.caption("Note: each filing is a live SEC request, so wider ranges/more filings = longer scan time.")
 
 if "df" not in st.session_state:
     st.session_state.df = pd.DataFrame()
@@ -466,17 +497,25 @@ if search_btn and ticker_search:
         st.session_state.mode_label = f"Single-ticker search: {ticker_search.upper()} (Market cap: {mcap_str})"
 
 if run_btn:
-    if scan_mode == "Specific date":
-        with st.spinner(f"Retrieving all Form 4 filings for {selected_date}..."):
-            df, scanned, available = run_market_scan_for_date(
-                selected_date, cap_ceiling_b * 1e9, one_off_m * 1e6, ceo_only, max_filings, lookback_years
-            )
-        if not available:
-            st.warning(f"No SEC filing index available for {selected_date} — it may be a weekend, "
-                       f"market holiday, or a date SEC hasn't published yet. Try a nearby weekday.")
-        st.session_state.df = df
-        st.session_state.scanned = scanned
-        st.session_state.mode_label = f"Market scan: {selected_date}"
+    if scan_mode == "Date range":
+        if isinstance(date_range, tuple) and len(date_range) == 2:
+            range_start, range_end = date_range
+        else:
+            range_start = range_end = date_range
+        if range_start > range_end:
+            st.error("Start date must be before end date.")
+        else:
+            with st.spinner(f"Retrieving all Form 4 filings from {range_start} to {range_end}..."):
+                df, scanned, days_with_data = run_market_scan_for_date_range(
+                    range_start, range_end, cap_ceiling_b * 1e9, one_off_m * 1e6,
+                    ceo_only, max_filings, lookback_years
+                )
+            if days_with_data == 0:
+                st.warning(f"No SEC filing index available for {range_start} to {range_end} — "
+                           f"check that the range includes weekdays SEC has published data for.")
+            st.session_state.df = df
+            st.session_state.scanned = scanned
+            st.session_state.mode_label = f"Market scan: {range_start} to {range_end} ({days_with_data} trading day(s) with data)"
     else:
         with st.spinner(f"Scanning last {days_back} day(s) of Form 4 filings market-wide..."):
             df, scanned = run_market_scan_recent(
